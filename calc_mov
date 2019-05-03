@@ -1,0 +1,141 @@
+#!/bin/csh -f
+#
+# This script calculates  a timeseries of yearly means of the M_ov integral on 2 different latitudes theta_s and theta_n for a specific POP run.
+# The M_ov integral is defined as:   
+# M_ov = - (r_0 / s_0) * integral{v_int_dx * (s_ave - s_0) * dz}  # integrated over a zonal ocean section in the atlantic at latitude theta (theta_s or theta_n)
+# With:
+# v_int_dx = (1 / r_0) * integral{v * dx}
+# s_int_dx = (1 / r_0) * integral{v * dx}
+# s_ave    = s_int_dx / ( (1 / r_0) * integral{ dx } ) = integral{v * dx} / integral { dx }
+# Here dx is the length of a gridbox in the i-direction in meters (= r_0 * cos (theta) * dphi    for latitude theta and dphi = 0.1 degrees)
+
+# -----------------------------------
+#  User can change parameters below
+# -----------------------------------
+set case           = feedback	 
+set scriptsdir     = /home/geoeng/michael/Mov/GLENS_gx1
+set inputdir       = /projects/0/prace_imau/prace_2013081679/cesm1_3/niek/MOV/$case
+set inputfile_base = "SALT_VVEL_SSH_SFWF_${case}_1_21"
+set referencefile  = "$inputdir/SALT_VVEL_SSH_SFWF_${case}_1_21_2070.nc" # file used to determine Atlantic mask and $j_s and $j_n, should contain KMT and ULAT
+
+
+# set dimensions POP data
+set imt = 320
+set jmt = 384
+set km  = 60
+
+# Set both latitudes on which to integrate
+set theta_s     = -34 
+set theta_s_str = 34S 
+set theta_n     =  60
+set theta_n_str = 60N
+
+# timeseries info
+set startyear  = 2050
+set endyear    = 2069
+
+set outputfile     = salt_budgets_lats_${theta_s_str}_${theta_n_str}_${case}_${startyear}-${endyear}
+
+# -----------------------------------
+#  NO NEED TO CHANGE ANYTHING BELOW HERE 
+# -----------------------------------
+
+echo ""
+echo "case is: $case"
+echo "theta_s is: $theta_s"
+echo "theta_n is: $theta_n"
+echo ""
+
+# first determine the j indices on the original curvilinear POP grid belonging to latitudes theta_s and theta_n
+# find_j.sc below needs as argument 1 a netcdf file containing the ULAT variable and as argument 2 the requested latitude 
+echo "determine j_s and j_n indices belonging to theta_s and theta_n"
+$scriptsdir/find_j.sc $referencefile $theta_s  >&/dev/null
+
+# we need the j index on the U grid, extract it from the third line in file j_index (created by find_j.sc)
+set j_s = `awk FNR==3 j_index | awk 'BEGIN { FS = ":" } ; { print $2 }' | awk 'BEGIN { FS = "." } ; { print $1 }'`
+
+# do the same for theta_n
+$scriptsdir/find_j.sc $referencefile $theta_n  >&/dev/null
+set j_n = `awk FNR==3 j_index | awk 'BEGIN { FS = ":" } ; { print $2 }' | awk 'BEGIN { FS = "." } ; { print $1 }'`
+
+echo "j_s is: " $j_s 
+echo "j_n is: " $j_n 
+
+# determine mask of Atlantic starting at latitude belonging to j_s and ending at j_n 
+# first create namelist for fortran program create_Atlantic_mask_gx1 
+# 3th value is 0 means Atlantic, 1 means Pacific
+
+cat > in_mask << EOF
+$imt, $jmt, $km
+$j_s, $j_n
+0
+$referencefile
+EOF
+
+echo ""
+echo "determine Atlantic mask "
+./create_Atlantic_mask_gx1 < in_mask  >& /dev/null
+
+echo ""
+echo "calculating budgets"
+
+set y = $startyear
+while ( $y <= $endyear )
+  # Turn y into 4 character string and fill out with zeros, e.g. y = 75 becomes 0075
+  set y_str = `echo $y | awk '{printf("%04d\n",$0)}'`
+
+  # Determine name of inputfile e.g. SALT_VVEL_${case}_1_21_2070.nc
+  echo "$inputdir/${inputfile_base}_${y_str}.nc"
+  set inputfile_SALT  = $inputdir/${inputfile_base}_${y_str}.nc
+  set inputfile_VVEL  = $inputdir/${inputfile_base}_${y_str}.nc
+  set inputfile_SSH   = $inputdir/${inputfile_base}_${y_str}.nc
+  set inputfile_SFWF  = $inputdir/${inputfile_base}_${y_str}.nc
+
+  # START WITH THE CALCULATION OF THE M_OV INTEGRAL
+
+  # Use M_ov_calculation which is a modified version of Mat maltrud's fortran program mass_flux_pbc.f90 to calculate the M_ov integral at both latitudes
+  # This program needs the following arguments:
+  #
+  # 1.  320,384,60             dimensions of grid 
+  # 2.  j_s j_n                start and end indexes of the south resp. north latitude line in the atlantic that we integrate over (determined by script find_j.sc)
+  # 3.  0                      0 means Atlantic, 1 means Pacific
+  # 4.  testfile_SALT_2070.nc  inputfile containing SALT
+  # 5.  testfile_VVEL_2070.nc  inputfile containing VVEL
+  # 6.  testfile_SSH_2070.nc   inputfile containing SSH
+  # 7.  testfile_SFWF_2070.nc  inputfile containing SFWF
+  # 6.  in_depths.dat          name of in_depths file (containing thickness of depth levels)
+
+  # We will put all arguments in a namelist file in_salt_budget
+
+  echo "$imt,$jmt,$km" 					> in_salt_budget
+  echo "$j_s $j_n" 					>> in_salt_budget
+  echo "0"         					>> in_salt_budget
+  echo "$inputfile_SALT"          			>> in_salt_budget
+  echo "$inputfile_VVEL"          			>> in_salt_budget
+  echo "$inputfile_SSH" 				>> in_salt_budget
+  echo "$inputfile_SFWF" 				>> in_salt_budget
+  echo "in_depths.dat" 				        >> in_salt_budget
+
+
+  # Offer namelist to fortran program
+  ./Atlantic_salt_budget_gx1 < in_salt_budget >& /dev/null
+
+   set output = `cat Atlantic_salt_budget_value`
+   echo "year is ${y_str}"
+   echo "salt budget values for year $y_str are: $output"
+
+  if ($y == $startyear) then 
+    echo "$y_str $output "  > $outputfile
+  else
+    echo "$y_str $output " >> $outputfile
+  endif
+  @ y = $y + 1
+end  
+
+# Add first line to $outputfile with column headers
+sed  -i '1i year area             volume           SSH_int           sT                eT                SALT_int         SALT_SSH_int      sS0*1000         sM_ov            sM_az            sM_tot           eS0*1000         eM_ov             eM_az            eM_tot           EPR' $outputfile
+
+echo ""
+echo "the calculated salt budget values (Mov, Maz etc) at latitudes $theta_s_str and $theta_n_str are put in file: $outputfile" 
+
+
